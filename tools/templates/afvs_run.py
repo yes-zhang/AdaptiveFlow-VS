@@ -520,6 +520,77 @@ def docking_process_clean_common(item):
     shutil.rmtree(item['tmp_run_dir'])
     item['seconds'] = time.perf_counter() - item['start_time']
 
+
+def docking_process_batch_attempt(batched_item, temp_dir):
+    # Run a batch of items through their batch-mode docking program. Some
+    # batch-mode programs (e.g. GPU tools that process a whole ligand
+    # directory in one invocation) crash the *entire* invocation if a single
+    # ligand has a degenerate input (see: QuickVina2-GPU tree.h crash on
+    # zero-length bonds from bad --gen3d embeddings). Rather than lose the
+    # whole batch, bisect it and retry each half independently to isolate
+    # exactly which ligand(s) are actually bad.
+
+    docking_process_setup_common(batched_item, "batch", temp_dir)
+
+    for item in batched_item['items']:
+        with open(f"{item['output_dir']}/dock_uuid", "w") as output_f:
+            output_f.write(f"{batched_item['uuid']}\n")
+
+    ret = None
+    try:
+        cmd = program_runstring_array_batch(batched_item)
+    except RuntimeError as err:
+        logging.error(f"Invalid cmd generation for batched execution (program: '{batched_item['program']}')")
+        raise(err)
+
+    try:
+        ret = subprocess.run(cmd, capture_output=True,
+                 text=True, cwd=batched_item['tmp_run_dir_input'], timeout=batched_item['timeout'])
+    except subprocess.TimeoutExpired:
+        logging.error(f"Batched execution timed out for {len(batched_item['items'])} item(s)")
+
+    if ret is not None and ret.returncode == 0:
+        process_docking_completion_batch(batched_item, ret)
+        with open(batched_item['log_path'], "w") as output_f:
+            output_f.write(f"STDOUT:\n{ret.stdout}\n")
+            output_f.write(f"STDERR:\n{ret.stderr}\n")
+        docking_process_clean_common(batched_item)
+        return
+
+    if len(batched_item['items']) == 1:
+        # Bisection bottomed out -- this is the actual bad ligand.
+        item = batched_item['items'][0]
+        if ret is not None:
+            reason = f"Non zero return code (isolated single-ligand crash) for {item['ligand_key']}"
+            logging.error(reason)
+            logging.error(f"stdout:\n{ret.stdout}\nstderr:{ret.stderr}\n")
+            with open(batched_item['log_path'], "w") as output_f:
+                output_f.write(f"STDOUT:\n{ret.stdout}\n")
+                output_f.write(f"STDERR:\n{ret.stderr}\n")
+        else:
+            reason = f"Timeout (isolated single-ligand) for {item['ligand_key']}"
+            logging.error(reason)
+        item['log']['reason'] = reason
+        item['status'] = "failed"
+        docking_process_clean_common(batched_item)
+        return
+
+    # More than one item and it failed -- bisect and retry each half.
+    logging.warning(f"Batch of {len(batched_item['items'])} failed for program "
+                     f"'{batched_item['program']}' -- bisecting and retrying")
+    docking_process_clean_common(batched_item)
+
+    mid = len(batched_item['items']) // 2
+    for half_items in (batched_item['items'][:mid], batched_item['items'][mid:]):
+        sub_batched_item = {
+            'items': half_items,
+            'program': batched_item['program'],
+            'execution_type': batched_item['execution_type'],
+            'scenario_key': batched_item['scenario_key'],
+        }
+        docking_process_batch_attempt(sub_batched_item, temp_dir)
+
+
 def docking_process_batch(summary_queue, scenario, items, temp_dir):
 
     if(len(items) == 0):
@@ -587,52 +658,10 @@ def docking_process_batch(summary_queue, scenario, items, temp_dir):
             docking_process_clean_common(item)
 
     elif batched_item['execution_type'] == "batch":
-        ret = None
-
-        docking_process_setup_common(batched_item, "batch", temp_dir)
-
         print(f"processing batch of {len(batched_item['items'])} items")
-
-        # Mark which docking these ligands were associated with
-        for item in batched_item['items']:
-            with open(f"{item['output_dir']}/dock_uuid", "w") as output_f:
-                output_f.write(f"{item['uuid']}\n")
-
-        try:
-            cmd = program_runstring_array_batch(batched_item)
-        except RuntimeError as err:
-            logging.error(f"Invalid cmd generation for batched execution (program: '{batched_item['program']}')")
-            raise(err)
-
-        try:
-            ret = subprocess.run(cmd, capture_output=True,
-                     text=True, cwd=batched_item['tmp_run_dir_input'], timeout=batched_item['timeout'])
-        except subprocess.TimeoutExpired as err:
-            reason = "Batched execution timed out"
-            for item in batched_item['items']:
-                item['log']['reason'] = reason
-            logging.error(reason)
-
-        if ret != None:
-            if ret.returncode == 0:
-                process_docking_completion_batch(batched_item, ret)
-            else:
-                reason = f"Non zero return code for batched execution"
-                for item in batched_item['items']:
-                    item['log']['reason'] = reason
-
-                logging.error(reason)
-                logging.error(f"stdout:\n{ret.stdout}\nstderr:{ret.stderr}\n")
-
-
-            # Place output into files
-            with open(batched_item['log_path'], "w") as output_f:
-                output_f.write(f"STDOUT:\n{ret.stdout}\n")
-                output_f.write(f"STDERR:\n{ret.stderr}\n")
-
-
-        print(f"processing - done in {batched_item['seconds']}")
-        docking_process_clean_common(batched_item)
+        start = time.perf_counter()
+        docking_process_batch_attempt(batched_item, temp_dir)
+        print(f"processing - done in {time.perf_counter() - start}")
 
     else:
         logging.error(f"Invalid ligand processing model for program {scenario['program']}")
@@ -2818,6 +2847,61 @@ def docking_finish_autodock(item, ret):
     except:
         logging.error("failed parsing")
 
+## QuickVina2-GPU (batch mode -- docks a whole ligand directory in one call)
+
+def docking_start_qvina2_gpu(batch_item):
+    with open(batch_item['config_path']) as fd:
+        config_ = dict(read_config_line(line) for line in fd)
+    for key in config_:
+        if '#' in config_[key]:
+            config_[key] = config_[key].split('#')[0].strip()
+
+    ligand_dir = Path(batch_item['tmp_run_dir']) / "ligands"
+    ligand_dir.mkdir(parents=True, exist_ok=True)
+
+    output_dir = Path(batch_item['tmp_run_dir']) / "docked"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    batch_item['qvina2_gpu_output_dir'] = str(output_dir)
+
+    for item in batch_item['items']:
+        os.symlink(os.path.abspath(item['ligand_path']), ligand_dir / f"{item['ligand_key']}.pdbqt")
+
+    cmd = [
+        f"{batch_item['tools_path']}/QuickVina2-GPU/QuickVina2-GPU-2-1",
+        '--receptor', config_['receptor'],
+        '--ligand_directory', str(ligand_dir),
+        '--output_directory', str(output_dir),
+        '--center_x', config_['center_x'],
+        '--center_y', config_['center_y'],
+        '--center_z', config_['center_z'],
+        '--size_x', config_['size_x'],
+        '--size_y', config_['size_y'],
+        '--size_z', config_['size_z'],
+        '--thread', config_.get('thread', '8000'),
+        '--opencl_binary_path', f"{batch_item['tools_path']}/QuickVina2-GPU",
+    ]
+    return cmd
+
+def docking_finish_qvina2_gpu(batch_item, ret):
+    output_dir = Path(batch_item['qvina2_gpu_output_dir'])
+
+    for item in batch_item['items']:
+        out_path = output_dir / f"{item['ligand_key']}_out.pdbqt"
+
+        if not out_path.is_file():
+            item['log']['reason'] = f"No output file for {item['ligand_key']}"
+            logging.error(item['log']['reason'])
+            continue
+
+        match = re.search(r'REMARK VINA RESULT:\s*(?P<value>[-0-9.]+)', out_path.read_text())
+        if match:
+            item['score'] = float(match.group('value'))
+            item['status'] = "success"
+            shutil.move(str(out_path), item['output_dir'])
+        else:
+            item['log']['reason'] = f"Could not find score for {item['ligand_key']}"
+            logging.error(item['log']['reason'])
+
 ## FRED
 
 def docking_start_fred(task):
@@ -3895,6 +3979,11 @@ DOCKING_PROGRAMS = {
         'start': docking_start_autodock_gpu,
         'end': docking_finish_autodock,
         'ligands': "single"
+    },
+    'qvina2_gpu': {
+        'start': docking_start_qvina2_gpu,
+        'end': docking_finish_qvina2_gpu,
+        'ligands': "batch"
     },
     'autodock_koto': {
         'start': docking_start_autodock_koto,

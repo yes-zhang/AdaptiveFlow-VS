@@ -202,6 +202,7 @@ def submit_lsf(config, client, current_workunit, jobline):
         "array_start": "1",
         "array_end": subjobs_count,
         "lsf_cpus": config['lsf_cpus'],
+        "lsf_gpus": config.get('lsf_gpus', 0),
         "lsf_queue": config['lsf_queue'],
         "lsf_walltime": config['lsf_walltime'],
         "lsf_memory": config['lsf_memory'],

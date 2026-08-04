@@ -99,6 +99,9 @@ lsf_template=./templates/template1.lsf.sh
 # Additional LSF attributes can be added directly to this
 # template file if they are not available as pass throughs from
 # AFVS
+# For GPU-based docking scenarios (e.g. qvina2_gpu), use
+# ./templates/template1_gpu.lsf.sh instead, which adds the GPU
+# resource request driven by lsf_gpus below.
 
 lsf_array_job_throttle=1000
 # Maximum number of jobs running within a single LSF array job
@@ -112,6 +115,12 @@ lsf_cpus=1
 # (set for initial testing; increase for production runs.
 #  Values >1 rely on 'span[hosts=1]' in the LSF template to keep
 #  all requested cores on a single host)
+
+lsf_gpus=1
+# Number of GPUs requested per subjob (only used by template1_gpu.lsf.sh,
+# rendered as '#BSUB -gpu "num={{lsf_gpus}}/host"'). Ignored by the
+# CPU-only template. Confirmed working syntax for this cluster's LSF
+# GPU scheduling -- verify it still matches if switching clusters.
 
 lsf_array_job_size=1000
 # Maximum number of concurrent jobs from a single array job
