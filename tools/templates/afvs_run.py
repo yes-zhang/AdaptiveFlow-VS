@@ -688,6 +688,7 @@ def docking_process_batch(summary_queue, scenario, items, temp_dir):
 def move_batch_logs(item, scenario_directories):
 
     scenario_dest = Path(scenario_directories[item['scenario_key']]) / "batch_exec" / item['uuid']
+    scenario_dest.mkdir(parents=True, exist_ok=True)
     batch_output = Path(item['output_dir'])
     for dir_file in batch_output.iterdir():
         shutil.move(str(dir_file), f"{str(scenario_dest)}/")
