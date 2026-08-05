@@ -545,7 +545,8 @@ def docking_process_batch_attempt(batched_item, temp_dir):
 
     try:
         ret = subprocess.run(cmd, capture_output=True,
-                 text=True, cwd=batched_item['tmp_run_dir_input'], timeout=batched_item['timeout'])
+                 text=True, cwd=batched_item.get('run_cwd', batched_item['tmp_run_dir_input']),
+                 timeout=batched_item['timeout'])
     except subprocess.TimeoutExpired:
         logging.error(f"Batched execution timed out for {len(batched_item['items'])} item(s)")
 
@@ -587,6 +588,10 @@ def docking_process_batch_attempt(batched_item, temp_dir):
             'program': batched_item['program'],
             'execution_type': batched_item['execution_type'],
             'scenario_key': batched_item['scenario_key'],
+            'config_path': batched_item['config_path'],
+            'input_files_dir': batched_item['input_files_dir'],
+            'tools_path': batched_item['tools_path'],
+            'timeout': batched_item['timeout'],
         }
         docking_process_batch_attempt(sub_batched_item, temp_dir)
 
@@ -600,7 +605,11 @@ def docking_process_batch(summary_queue, scenario, items, temp_dir):
         'items': items,
         'program': scenario['program'],
         'execution_type': DOCKING_PROGRAMS[scenario['program']]['ligands'],
-        'scenario_key': scenario['key']
+        'scenario_key': scenario['key'],
+        'config_path': items[0]['config_path'],
+        'input_files_dir': items[0]['input_files_dir'],
+        'tools_path': items[0]['tools_path'],
+        'timeout': items[0]['timeout'],
     }
 
     for item in batched_item['items']:
@@ -2866,9 +2875,20 @@ def docking_start_qvina2_gpu(batch_item):
     for item in batch_item['items']:
         os.symlink(os.path.abspath(item['ligand_path']), ligand_dir / f"{item['ligand_key']}.pdbqt")
 
+    # QuickVina2-GPU-2-1 ignores --opencl_binary_path in practice -- it only
+    # ever looks for Kernel1_Opt.bin/Kernel2_Opt.bin next to its own launch
+    # directory (confirmed empirically on the LSF cluster: passing
+    # --opencl_binary_path pointing elsewhere still fails with "failed to
+    # open file ./OpenCL/src/kernels/code_head.cl" and a segfault). So the
+    # subprocess must be launched with its cwd set to the kernel-bin
+    # directory itself, not tmp_run_dir_input like other batch programs --
+    # the receptor path has to be made absolute here to survive that.
+    batch_item['run_cwd'] = f"{batch_item['tools_path']}/QuickVina2-GPU"
+    receptor_path = os.path.normpath(os.path.join(batch_item['tmp_run_dir_input'], config_['receptor']))
+
     cmd = [
         f"{batch_item['tools_path']}/QuickVina2-GPU/QuickVina2-GPU-2-1",
-        '--receptor', config_['receptor'],
+        '--receptor', receptor_path,
         '--ligand_directory', str(ligand_dir),
         '--output_directory', str(output_dir),
         '--center_x', config_['center_x'],
